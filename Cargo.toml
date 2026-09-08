@@ -1,0 +1,33 @@
+[package]
+name = "e4pty"
+version = "0.1.9"
+edition = "2024"
+authors = ["km0e <kmdr.error@gmail.com>"]
+repository = "https://github.com/km0e/e4pty.git"
+description = "abstract api for pty"
+license = "MIT"
+
+[dependencies]
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+strum = { version = "0.28", features = ["derive"] }
+tempfile = "3.27"
+thiserror = "2.0"
+tokio = { version = "1.51", features = ["fs", "rt-multi-thread"] }
+tracing = "0.1"
+
+[target.'cfg(not(windows))'.dependencies]
+rustix-openpty = "0.2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+rustix = { version = "1.1", features = ["process"] }
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_System_IO",
+] }
