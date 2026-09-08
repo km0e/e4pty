@@ -1,0 +1,142 @@
+use e4pty::prelude::*;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+/// Serialize tests that create temp script files, so the leak check in
+/// `smoke_temp_script_self_cleanup` is deterministic under parallel runs.
+static TMP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Spawn a `sh` script in a pty, read it to EOF and return (output, exit).
+async fn run_script(input: &str) -> (String, i32) {
+    let mut pty = openpty(WindowSize::default(), Script::sh(input)).expect("openpty failed");
+    let mut out = Vec::new();
+    pty.reader.read_to_end(&mut out).await.expect("read failed");
+    let code = pty.wait().await.expect("wait failed");
+    (String::from_utf8_lossy(&out).into_owned(), code)
+}
+
+#[tokio::test]
+async fn smoke_basic() {
+    let _g = TMP_LOCK.lock().await;
+    let (out, code) = run_script("echo hello-e4pty; exit 0").await;
+    assert!(out.contains("hello-e4pty"), "unexpected output: {out:?}");
+    assert_eq!(code, 0, "exit code mismatch");
+}
+
+#[tokio::test]
+async fn smoke_line_form() {
+    // `Script::line` tokenizes and execs directly, no temp file, no shell.
+    let mut pty = openpty(WindowSize::default(), Script::line("echo line-form-works"))
+        .expect("openpty failed");
+    let mut out = Vec::new();
+    pty.reader.read_to_end(&mut out).await.expect("read failed");
+    let code = pty.wait().await.expect("wait failed");
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains("line-form-works"), "output: {text:?}");
+    assert_eq!(code, 0);
+}
+
+#[tokio::test]
+async fn smoke_exec_argv() {
+    // `Script::exec` passes verbatim argv (spaces inside args survive).
+    let mut pty = openpty(
+        WindowSize::default(),
+        Script::exec("sh", ["-c", "printf 'argv with  spaces'; exit 0"]),
+    )
+    .expect("openpty failed");
+    let mut out = Vec::new();
+    pty.reader.read_to_end(&mut out).await.expect("read failed");
+    let code = pty.wait().await.expect("wait failed");
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains("argv with  spaces"), "output: {text:?}");
+    assert_eq!(code, 0);
+}
+
+#[tokio::test]
+async fn smoke_write_and_window_change() {
+    let _g = TMP_LOCK.lock().await;
+    let mut pty = openpty(
+        WindowSize::default(),
+        Script::sh("read line; echo got:$line; stty size; exit 0"),
+    )
+    .expect("openpty failed");
+
+    pty.writer.window_change(120, 40).await.expect("resize failed");
+    pty.writer
+        .write_all(b"ping-from-test\r\n")
+        .await
+        .expect("write failed");
+
+    let mut out = Vec::new();
+    pty.reader.read_to_end(&mut out).await.expect("read failed");
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains("got:ping-from-test"), "output: {text:?}");
+    // stty size should reflect the resized window (40 rows 120 cols)
+    assert!(text.contains("40 120"), "window size not applied: {text:?}");
+
+    let code = pty.wait().await.expect("wait failed");
+    assert_eq!(code, 0);
+}
+
+#[tokio::test]
+async fn smoke_exit_code_signal() {
+    let _g = TMP_LOCK.lock().await;
+    // child killed by signal -> exit code should be 128 + signal (unix);
+    // Windows/msys signal emulation varies, so only unix asserts it.
+    let (_out, code) = run_script("kill -TERM $$").await;
+    #[cfg(unix)]
+    assert_eq!(code, 128 + 15, "signal exit code mismatch, got {code}");
+    #[cfg(not(unix))]
+    let _ = code;
+}
+
+#[tokio::test]
+#[cfg(unix)] // inspects the unix temp dir for leaked script files
+async fn smoke_temp_script_self_cleanup() {
+    let _g = TMP_LOCK.lock().await;
+    // Shell scripts write a temp file with a cleanup hook installed before
+    // the user source; even an early `exit` must not leak the file.
+    let count_tmp = || {
+        std::fs::read_dir("/tmp")
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".tmp"))
+            .count()
+    };
+    let before = count_tmp();
+    let (out, code) = run_script("echo done; exit 0").await;
+    assert!(out.contains("done"));
+    assert_eq!(code, 0);
+    let after = count_tmp();
+    assert_eq!(before, after, "temp script files leaked");
+}
+
+#[tokio::test]
+async fn smoke_split_handles() {
+    // `Pty::split` must yield independently usable handles: drive reader
+    // and ctl from different tasks while writing from this one.
+    let _g = TMP_LOCK.lock().await;
+    let pty = openpty(WindowSize::default(), Script::sh("cat; exit 0"))
+        .expect("openpty failed");
+    let (mut ctl, mut writer, mut reader) = pty.split();
+
+    let reader_task = tokio::spawn(async move {
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await.expect("read failed");
+        String::from_utf8_lossy(&out).into_owned()
+    });
+    let ctl_task = tokio::spawn(async move { ctl.wait().await.expect("wait failed") });
+
+    writer
+        .write_all(b"split-handles\r\n")
+        .await
+        .expect("write failed");
+    // `cat` is in canonical mode: EOT (Ctrl+D) ends its stdin read.
+    writer.write_all(b"\x04").await.expect("write EOT failed");
+    // Drop the writer dup afterwards; the reader fd keeps the pty alive
+    // until `cat` exits and the master reports EOF/EIO.
+    drop(writer);
+
+    let out = reader_task.await.expect("reader task panicked");
+    assert!(out.contains("split-handles"), "output: {out:?}");
+    assert_eq!(ctl_task.await.expect("ctl task panicked"), 0);
+}
