@@ -51,23 +51,24 @@
 /// Everything needed to drive a pty: [`openpty`], [`Script`],
 /// [`WindowSize`], the handle traits and [`Pty`].
 pub mod prelude {
-    /// Everything needed to drive a pty: [`openpty`], [`Script`],
-    /// [`WindowSize`], the handle traits and [`Pty`].
-    pub use crate::backend::openpty;
+    /// Everything needed to drive a pty: [`openpty`], [`PtyBuilder`],
+    /// [`Script`], [`WindowSize`], the handle traits and [`Pty`].
     pub use crate::pty::{
         BoxedPtyCtl, BoxedPtyReader, BoxedPtyWriter, Pty, PtyCtl, PtyReader, PtyWriter, WindowSize,
     };
     pub use crate::script::{Script, Shell};
+    pub use crate::spawn::{PtyBuilder, openpty};
 }
 
 mod backend;
 mod error;
 mod pty;
 mod script;
+mod spawn;
 
-pub use backend::openpty;
 pub use error::{Error, Result};
 pub use pty::{
     BoxedPtyCtl, BoxedPtyReader, BoxedPtyWriter, Pty, PtyCtl, PtyReader, PtyWriter, WindowSize,
 };
 pub use script::{Script, Shell};
+pub use spawn::{PtyBuilder, openpty};

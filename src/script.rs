@@ -141,12 +141,9 @@ impl Script {
         match self {
             Script::Line(line) => {
                 let mut it = line.split_whitespace();
-                let program = it
-                    .next()
-                    .ok_or_else(|| std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "empty command line",
-                    ))?;
+                let program = it.next().ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty command line")
+                })?;
                 Ok(Resolved {
                     program: program.into(),
                     args: it.map(Into::into).collect(),

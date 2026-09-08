@@ -42,7 +42,7 @@ MSRV: **1.85** (edition 2024).
 
 ```toml
 [dependencies]
-e4pty = "0.2"
+e4pty = "0.3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util"] }
 ```
 
@@ -81,6 +81,23 @@ The three handles are independent — split them across tasks:
 let (mut ctl, writer, mut reader) = pty.split();
 tokio::spawn(async move { /* drain reader */ });
 tokio::spawn(async move { /* wait for exit */ });
+```
+
+### Working directory & environment
+
+`openpty` inherits the parent's cwd and environment; [`PtyBuilder`]
+(unix-style `std::process::Command` semantics) customizes both:
+
+```rust
+use e4pty::prelude::*;
+
+let mut pty = PtyBuilder::new(WindowSize::default(), Script::sh("ls -la"))
+    .current_dir("/tmp")
+    .env("TERM", "xterm-256color")
+    .env_remove("GIT_DIR")
+    // .env_clear()            // start from an empty environment
+    // .envs([("A", "1"), ("B", "2")])
+    .spawn()?;
 ```
 
 ## API overview
@@ -164,6 +181,15 @@ CI (`.github/workflows/ci.yml`) runs the test suite on all three
 platforms, an MSRV job, clippy/doc lints and the cross-target matrix.
 
 ## Changelog
+
+### 0.3.0
+
+- Added working-directory and environment support:
+  `PtyBuilder::current_dir` / `env` / `envs` / `env_remove` / `env_clear`
+  (`std::process::Command` semantics); `openpty(window_size, script)`
+  stays as the inherit-everything shortcut. On Windows the child
+  environment is materialized into a `CreateProcessW` block with
+  case-insensitive deduplication (`lpEnvironment` / `lpCurrentDirectory`).
 
 ### 0.2.0 (breaking)
 

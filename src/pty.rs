@@ -91,7 +91,11 @@ pub struct Pty {
 
 impl Pty {
     /// Bundle three concrete handle implementations into a [`Pty`].
-    pub fn new(ctl: impl PtyCtl + 'static, writer: impl PtyWriter + 'static, reader: impl PtyReader + 'static) -> Self {
+    pub fn new(
+        ctl: impl PtyCtl + 'static,
+        writer: impl PtyWriter + 'static,
+        reader: impl PtyReader + 'static,
+    ) -> Self {
         Self {
             ctl: Box::new(ctl),
             writer: Box::new(writer),
@@ -112,6 +116,10 @@ impl Pty {
 
 impl From<(BoxedPtyCtl, BoxedPtyWriter, BoxedPtyReader)> for Pty {
     fn from((ctl, writer, reader): (BoxedPtyCtl, BoxedPtyWriter, BoxedPtyReader)) -> Self {
-        Self { ctl, writer, reader }
+        Self {
+            ctl,
+            writer,
+            reader,
+        }
     }
 }

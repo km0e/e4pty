@@ -41,7 +41,7 @@ use windows::core::*;
 
 use crate::error::Result;
 use crate::pty::{Pty, PtyCtl, PtyReader, PtyWriter, WindowSize};
-use crate::script::Script;
+use crate::spawn::SpawnSpec;
 
 /// Messages flowing from the async [`PtyWriter`] to the writer thread.
 enum WriterMsg {
@@ -274,14 +274,16 @@ impl From<WindowSize> for COORD {
     }
 }
 
-/// Spawn `command` attached to a fresh ConPTY pseudoconsole (Windows backend).
+/// Spawn `spec.script` attached to a fresh ConPTY pseudoconsole (Windows backend).
 ///
 /// Unlike the Unix backend this assembles the command line itself
 /// (wide-char `CreateProcessW` semantics) instead of using
 /// [`std::process::Command`]. Arguments are quoted with the standard
-/// Windows argv escaping rules.
-pub fn openpty(window_size: WindowSize, command: Script) -> Result<Pty> {
-    let resolved = command.materialize()?;
+/// Windows argv escaping rules; the working directory and environment
+/// are passed via `lpCurrentDirectory` / `lpEnvironment`.
+pub(crate) fn openpty(spec: SpawnSpec) -> Result<Pty> {
+    let resolved = spec.script.materialize()?;
+    let window_size = spec.window_size;
 
     // conout: the parent reads child output. CreatePipe yields
     // (read end `conout` we keep, write end `conout_pty` for ConPTY).
@@ -349,6 +351,17 @@ pub fn openpty(window_size: WindowSize, command: Script) -> Result<Pty> {
     cmdline.push(0);
     debug!("command line: {}", String::from_utf16_lossy(&cmdline));
 
+    // Working directory (None → inherit) and environment (None → inherit;
+    // otherwise a NUL-separated UTF-16 "NAME=VALUE" block, double-NUL
+    // terminated). The buffers must outlive the `CreateProcessW` call.
+    let cwd_wide: Option<Vec<u16>> = spec.current_dir.as_ref().map(|dir| {
+        dir.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    });
+    let env_block: Option<Vec<u16>> = spec.env.map(build_env_block);
+
     let creation_flags = EXTENDED_STARTUPINFO_PRESENT;
     let mut proc_info = PROCESS_INFORMATION::default();
 
@@ -360,8 +373,13 @@ pub fn openpty(window_size: WindowSize, command: Script) -> Result<Pty> {
             None,
             false,
             creation_flags,
-            None,
-            None,
+            env_block
+                .as_ref()
+                .map(|block| block.as_ptr() as *const core::ffi::c_void),
+            cwd_wide
+                .as_ref()
+                .map(|dir| PCWSTR::from_raw(dir.as_ptr()))
+                .unwrap_or_default(),
             &mut startup_info_ex.StartupInfo as *mut STARTUPINFOW,
             &mut proc_info as *mut PROCESS_INFORMATION,
         )
@@ -423,8 +441,9 @@ fn writer_thread(
                 let mut offset = 0;
                 while offset < data.len() {
                     let mut written = 0u32;
-                    let res =
-                        unsafe { WriteFile(pipe.get(), Some(&data[offset..]), Some(&mut written), None) };
+                    let res = unsafe {
+                        WriteFile(pipe.get(), Some(&data[offset..]), Some(&mut written), None)
+                    };
                     match res {
                         Ok(()) if written > 0 => offset += written as usize,
                         _ => return, // pipe broken: console is gone
@@ -460,11 +479,56 @@ fn reader_thread(pipe: SafeHandle, tx: mpsc::Sender<Vec<u8>>) {
     }
 }
 
+/// Build a `NAME=VALUE\0…\0` UTF-16 environment block for
+/// `CreateProcessW`.
+///
+/// Windows environment variable names are case-insensitive, so entries
+/// that collide case-insensitively are deduplicated with the last value
+/// winning (the parent env may hold `Path` while the caller overrides
+/// `PATH`, for example).
+fn build_env_block(vars: Vec<(std::ffi::OsString, std::ffi::OsString)>) -> Vec<u16> {
+    fn upper16(c: u16) -> u16 {
+        if (b'a' as u16..=b'z' as u16).contains(&c) {
+            c - (b'a' as u16 - b'A' as u16)
+        } else {
+            c
+        }
+    }
+
+    let mut entries: Vec<(Vec<u16>, Vec<u16>)> = Vec::with_capacity(vars.len());
+    for (key, value) in vars {
+        let key16: Vec<u16> = key.encode_wide().collect();
+        match entries.iter_mut().find(|(name, _)| {
+            name.len() == key16.len()
+                && name
+                    .iter()
+                    .zip(&key16)
+                    .all(|(a, b)| upper16(*a) == upper16(*b))
+        }) {
+            Some(slot) => slot.1 = value.encode_wide().collect(),
+            None => entries.push((key16, value.encode_wide().collect())),
+        }
+    }
+
+    let mut block = Vec::new();
+    for (name, value) in entries {
+        block.extend(name);
+        block.push('=' as u16);
+        block.extend(value);
+        block.push(0);
+    }
+    block.push(0); // terminating double NUL
+    block
+}
+
 /// Resolve a program name to an absolute, NUL-terminated UTF-16 path via
 /// `SearchPathW` (appends `.exe` when the name has no extension).
 fn resolve_program(program: &OsStr) -> std::io::Result<Vec<u16>> {
     debug!("searching for {}", program.to_string_lossy());
-    let mut filename = program.encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let mut filename = program
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<u16>>();
     let mut buf = vec![0u16; MAX_PATH as usize];
     let len = unsafe {
         SearchPathW(

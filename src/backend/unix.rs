@@ -23,7 +23,7 @@ use tokio::process::Child;
 
 use crate::error::Result;
 use crate::pty::{Pty, PtyCtl, PtyReader, PtyWriter, WindowSize};
-use crate::script::Script;
+use crate::spawn::SpawnSpec;
 
 /// Truly asynchronous wait handle around the tokio child.
 struct UnixCtl {
@@ -143,7 +143,7 @@ impl AsyncRead for UnixReader {
 
 impl PtyReader for UnixReader {}
 
-/// Spawn `script` attached to a fresh pseudo-terminal (Unix backend).
+/// Spawn `spec.script` attached to a fresh pseudo-terminal (Unix backend).
 ///
 /// Steps:
 /// 1. resolve the script to `(program, args)` (shell scripts materialize
@@ -158,15 +158,16 @@ impl PtyReader for UnixReader {}
 /// 6. in the parent: keep two non-blocking fds to the master — a dup for
 ///    writes (CLOEXEC, never leaks into children) and the original for
 ///    reads — both registered with the tokio reactor.
-pub fn openpty(window_size: WindowSize, script: Script) -> Result<Pty> {
-    let resolved = script.materialize()?;
+pub(crate) fn openpty(spec: SpawnSpec) -> Result<Pty> {
+    let resolved = spec.script.materialize()?;
+    let WindowSize { rows, cols } = spec.window_size;
 
     // controller = master (we talk to it), user = slave (child attaches).
     let pair = rustix_openpty::openpty(
         None,
         Some(&Winsize {
-            ws_row: window_size.rows,
-            ws_col: window_size.cols,
+            ws_row: rows,
+            ws_col: cols,
             ws_xpixel: 0,
             ws_ypixel: 0,
         }),
@@ -181,6 +182,15 @@ pub fn openpty(window_size: WindowSize, script: Script) -> Result<Pty> {
 
     let mut builder = std::process::Command::new(&resolved.program);
     builder.args(&resolved.args);
+    if let Some(dir) = &spec.current_dir {
+        builder.current_dir(dir);
+    }
+    if let Some(vars) = spec.env {
+        // Exact-environment mode: drop the inherited one entirely, then
+        // apply the materialized list (see `EnvMod::materialize`).
+        builder.env_clear();
+        builder.envs(vars);
+    }
     // Setup child stdin/stdout/stderr (each `try_clone` is a fresh fd that
     // std re-dups onto fds 0/1/2 without CLOEXEC at spawn time).
     builder.stdin(pair.user.try_clone()?);
@@ -207,7 +217,6 @@ pub fn openpty(window_size: WindowSize, script: Script) -> Result<Pty> {
             Ok(())
         });
     }
-    // TODO: set working directory / environment
     // TODO: set signal handler
 
     let child = tokio::process::Command::from(builder).spawn()?;
