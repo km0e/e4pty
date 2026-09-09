@@ -48,10 +48,14 @@ use crate::spawn::SpawnSpec;
 
 /// Lifecycle tracing for field diagnostics (`E4PTY_DEBUG=1`): prints to
 /// stderr so `cargo test -- --nocapture` shows where a session stalls.
-fn trace(msg: impl std::fmt::Display) {
-    if std::env::var_os("E4PTY_DEBUG").is_some() {
-        eprintln!("[e4pty] {msg}");
-    }
+/// Lifecycle tracing for field diagnostics (`E4PTY_DEBUG=1`): prints to
+/// stderr so `cargo test -- --nocapture` shows where a session stalls.
+macro_rules! trace {
+    ($($arg:tt)*) => {
+        if std::env::var_os("E4PTY_DEBUG").is_some() {
+            eprintln!("[e4pty] {}", format_args!($($arg)*));
+        }
+    };
 }
 
 /// Messages flowing from the async [`PtyWriter`] to the writer thread.
@@ -162,9 +166,9 @@ impl ExitState {
 /// publishes the exit code. A tokio blocking-pool thread is deliberately
 /// *not* used: one `INFINITE` wait per session would exhaust the pool's
 /// default cap (512 threads) on long-lived sessions.
-fn wait_thread(process: SafeHandle, exit: Arc<ExitState>) {
+fn wait_thread(process: SafeHandle, conpty: Arc<ConptyCore>, exit: Arc<ExitState>) {
     unsafe { WaitForSingleObject(process.get(), INFINITE) };
-    trace("waiter: child handle signalled");
+    trace!("waiter: child handle signalled");
     let mut raw = 0u32;
     let code = match unsafe { GetExitCodeProcess(process.get(), &mut raw as *mut u32) } {
         Ok(()) => raw as i32,
@@ -173,9 +177,15 @@ fn wait_thread(process: SafeHandle, exit: Arc<ExitState>) {
             1
         }
     };
-    trace("waiter: child exited, code {code}");
+    trace!("waiter: child exited, code {code}");
     debug!("exit code: {}", code);
     exit.set(code);
+    // The console server's lifetime is tied to the HPCON handle, not to
+    // the client's: without this close, `ReadFile(conout)` never returns
+    // EOF after the child exits and readers hang forever (observed on
+    // windows-latest). Closing it here delivers reader EOF at child exit,
+    // mirroring the Unix backend. Idempotent: races with `WinCtl::drop`.
+    conpty.close();
 }
 
 /// Control half: owns the shared ConPTY state and the child's exit
@@ -195,7 +205,7 @@ struct WinCtl {
 
 impl Drop for WinCtl {
     fn drop(&mut self) {
-        trace("ctl dropped: closing ConPTY");
+        trace!("ctl dropped: closing ConPTY");
         self.conpty.close();
     }
 }
@@ -488,20 +498,22 @@ pub(crate) fn openpty(spec: SpawnSpec) -> Result<Pty> {
     drop(thread);
 
     let pid = unsafe { GetProcessId(proc_info.hProcess) };
-    trace("spawned pid {pid}");
+    trace!("spawned pid {pid}");
     let exit = Arc::new(ExitState::new());
-    // Dedicated waiter thread: takes ownership of the only process
-    // handle, parks until the child exits and publishes the code for
-    // `WinCtl::wait` (see the module docs for why not `spawn_blocking`).
-    // (`SafeHandle` first: raw `HANDLE` is `!Send` and cannot cross into
-    // the closure.)
-    let process = SafeHandle::from(proc_info.hProcess);
-    let exit_for_thread = Arc::clone(&exit);
-    std::thread::spawn(move || wait_thread(process, exit_for_thread));
 
     let conpty = Arc::new(ConptyCore {
         hpcon: Mutex::new(Some(pty_handle)),
     });
+
+    // Dedicated waiter thread: takes ownership of the only process
+    // handle, parks until the child exits, publishes the code for
+    // `WinCtl::wait` and closes the ConPTY so the reader sees EOF (see
+    // the module docs for why not `spawn_blocking`). (`SafeHandle` first:
+    // raw `HANDLE` is `!Send` and cannot cross into the closure.)
+    let process = SafeHandle::from(proc_info.hProcess);
+    let conpty_for_waiter = Arc::clone(&conpty);
+    let exit_for_thread = Arc::clone(&exit);
+    std::thread::spawn(move || wait_thread(process, conpty_for_waiter, exit_for_thread));
 
     // Channels between the async fronts and the blocking I/O threads.
     // Writer side is unbounded (see `WinWriter` docs); reader side is
@@ -546,7 +558,7 @@ fn writer_thread(
                     match res {
                         Ok(()) if written > 0 => offset += written as usize,
                         _ => {
-                            trace("writer: WriteFile broken, exiting");
+                            trace!("writer: WriteFile broken, exiting");
                             return; // pipe broken: console is gone
                         }
                     }
@@ -556,12 +568,12 @@ fn writer_thread(
                 let _ = conpty.resize(WindowSize { rows, cols });
             }
             WriterMsg::Eof => {
-                trace("writer: Eof message, dropping conin");
+                trace!("writer: Eof message, dropping conin");
                 break;
             }
         }
     }
-    trace("writer thread exiting");
+    trace!("writer thread exiting");
     // Dropping `pipe` (CloseHandle) is what delivers EOF to the child.
 }
 
@@ -579,18 +591,18 @@ fn reader_thread(pipe: SafeHandle, tx: mpsc::Sender<Vec<u8>>) {
                 chunks += 1;
                 if tx.blocking_send(buf[..bytes as usize].to_vec()).is_err() {
                     // Receiver dropped: nothing left to report to.
-                    trace("reader: receiver dropped");
+                    trace!("reader: receiver dropped");
                     break;
                 }
             }
             _ => {
                 // 0 bytes or error: console closed → EOF
-                trace("reader: ReadFile -> {res:?} (bytes={bytes}) after {chunks} chunks");
+                trace!("reader: ReadFile -> {res:?} (bytes={bytes}) after {chunks} chunks");
                 break;
             }
         }
     }
-    trace("reader thread exiting");
+    trace!("reader thread exiting");
 }
 
 /// Build a `NAME=VALUE\0…\0` UTF-16 environment block for

@@ -25,11 +25,17 @@
 //! - **reader EOF** — emitted when nothing holds the pty's *slave* side
 //!   open anymore (or the session was hung up). It does *not* mean "the
 //!   child exited": a child that closes its own stdio and keeps running
-//!   (daemonizers, `ssh -f`) yields EOF while still alive, and
+//!   (daemonizers, `ssh -f`) yields EOF while still alive on Linux, and
 //!   descendants that inherit the slave can delay EOF long after the
-//!   spawned child exited. On Windows/ConPTY, EOF instead tracks the end
-//!   of the console *session* (all clients exited, or the HPCON was
-//!   closed) rather than the child's stdio handles.
+//!   spawned child exited. Per-platform shape:
+//!   - **Linux**: EOF fires at the last slave close, so a stdio-closing
+//!     child produces it while still alive.
+//!   - **macOS**: EOF reliably fires at the session leader's exit; EOF
+//!     from a child merely closing its stdio may be deferred until then.
+//!   - **Windows**: the console server lives as long as the HPCON
+//!     handle, so e4pty closes the pseudoconsole when the spawned child
+//!     exits — reader EOF lands at child exit (Unix-like); the
+//!     stdio-close EOF does not exist there.
 //! - **[`PtyCtl::wait`]** — resolves when the *spawned child process*
 //!   was reaped. The exit code exists only here. It may complete before
 //!   the reader's EOF (descendants keep the slave open) or after it (the

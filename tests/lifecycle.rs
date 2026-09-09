@@ -90,8 +90,11 @@ async fn no_output_loss_before_eof() {
 
 /// `wait` without draining deadlocks: a chatty child fills the tty output
 /// buffer and blocks in `write` forever. Drain-then-wait is the only safe
-/// order — `Pty::finish` must drain first.
+/// order — `Pty::finish` must drain first. Unix-only: the blocking is a
+/// line-discipline/tty-buffer property; under ConPTY the output is a live
+/// render stream and the child may exit regardless of the reader.
 #[tokio::test]
+#[cfg(unix)]
 async fn wait_without_drain_deadlocks() {
     let pty = openpty(
         WindowSize::default(),
@@ -161,10 +164,12 @@ async fn wait_can_resolve_before_reader_eof() {
 
 /// Reader EOF does not imply child exit: a child that closes its own
 /// stdio (daemonizer / `ssh -f` shape) produces EOF at once while it
-/// keeps running; `wait` stays pending. Unix-only: under ConPTY the
-/// reader EOF tracks the console session end, not the child's stdio.
+/// keeps running; `wait` stays pending. Linux-only: EOF-at-stdio-close
+/// is a Linux pty property — on macOS it may be deferred until exit,
+/// and under ConPTY the console session (not the stdio handles) drives
+/// the reader's EOF.
 #[tokio::test]
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 async fn eof_can_resolve_before_child_exit() {
     let pty = openpty(
         WindowSize::default(),
