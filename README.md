@@ -27,6 +27,9 @@ with the same code on every supported platform.
   pty (`TIOCSWINSZ` on Unix, `ResizePseudoConsole` on Windows).
 - **Sane exit codes**: waits report `128 + signal` for signal-terminated
   children on Unix, mirroring shell convention.
+- **Session control**: `wait` for the exit code, `pid` for the child's
+  process id, `kill` to terminate it (`SIGKILL` / `TerminateProcess`),
+  and `Pty::finish()` for a drain-first batch-mode teardown.
 
 ## Platform support
 
@@ -83,6 +86,40 @@ tokio::spawn(async move { /* drain reader */ });
 tokio::spawn(async move { /* wait for exit */ });
 ```
 
+### Lifecycle contract
+
+A pty session exposes two independent completion signals, and **neither
+implies the other**:
+
+- **reader EOF** — fires when nothing holds the pty's *slave* side open
+  anymore. It does *not* mean "the child exited": a child that closes
+  its own stdio and keeps running (daemonizers) yields EOF while still
+  alive, and descendants that inherit the slave can delay EOF long past
+  the child's exit. On Windows/ConPTY, EOF tracks the end of the console
+  *session* instead of the child's stdio handles.
+- **`wait`** — resolves when the spawned child is reaped; the exit code
+  exists only here. It may complete *before* reader EOF (descendants
+  keep the slave open) or *after* it (the child closed its stdio).
+
+Safe teardown order for batch use: **drain the reader to EOF first, then
+wait** — never `wait` without consuming output, because a child blocked
+writing to a full tty output buffer never exits (deadlock).
+`Pty::finish()` implements the safe order and returns
+`(output, exit_code)`.
+
+For interactive use, split the handles and run the reader in its own
+task; `wait` may be awaited at spawn time or later — the reader's EOF
+does not depend on it.
+
+Dropping handles tears the session down: on Unix, dropping `ctl` does
+not kill the child (tokio reaps it — no zombie), while dropping reader
++ writer closes the master and `SIGHUP`s the foreground process group;
+on Windows, dropping `ctl` closes the ConPTY, which ends the session.
+To end a session explicitly, `kill()` then `wait()`. To end the *input*
+only, send `0x04` (canonical-mode EOT) — a tty master cannot be
+half-closed on Unix, so `PtyWriter::eof` is a no-op there (on Windows it
+closes the ConPTY input pipe, which the child observes as stdin EOF).
+
 ### Working directory & environment
 
 `openpty` inherits the parent's cwd and environment; [`PtyBuilder`]
@@ -108,8 +145,10 @@ let mut pty = PtyBuilder::new(WindowSize::default(), Script::sh("ls -la"))
 |---|---|
 | `pty.reader` (`AsyncRead`) | process output, terminal escape sequences included |
 | `pty.writer` (`PtyWriter`) | input (`AsyncWrite`), `window_change`, `eof` |
-| `pty.ctl` (`PtyCtl`) | `wait` for the exit code |
+| `pty.ctl` (`PtyCtl`) | `wait` for the exit code, `pid`, `kill` |
 | `pty.wait()` | shorthand for `ctl.wait()` |
+| `pty.pid()` / `pty.kill()` | child process id / terminate it (`SIGKILL`, `TerminateProcess`) |
+| `pty.finish()` | batch teardown: drain reader to EOF, then collect `(output, exit_code)` |
 | `pty.split()` | destructure into the three owned handles |
 
 ### Scripts
@@ -140,8 +179,12 @@ ask for one**:
   Children start with `setsid` + `TIOCSCTTY`, making the pty the
   controlling terminal of a new session — job control (`Ctrl+C`,
   `SIGTSTP`) works as expected.
-- **Windows**: ConPTY pipes only do blocking I/O, so two dedicated threads
-  own the pipe ends and bridge to async via bounded tokio channels.
+- **Windows**: ConPTY pipes only do blocking I/O, so three dedicated
+  threads own the blocking ends and bridge to async: a reader thread
+  pumps `conout` into a bounded channel, a writer thread applies
+  `WriteFile`/`ResizePseudoConsole`/EOF, and a waiter thread parks on
+  the child process handle and publishes the exit code (keeping
+  `INFINITE` waits off the tokio blocking pool).
   Drops are safe in any order: the `HPCON` lives behind an
   `Arc<Mutex<Option<_>>>` taken by `ClosePseudoConsole`, and closing the
   conin handle is what delivers EOF to the child. All handles are closed
@@ -155,9 +198,16 @@ ask for one**:
 
 ## Testing
 
-The repository ships integration tests (`tests/smoke.rs`) covering
-output, verbatim argv, input echo, window resize, signal exit codes,
-temp-file cleanup and independent handle usage across tasks:
+The repository ships integration tests:
+
+- `tests/smoke.rs` — output, verbatim argv, input echo, window resize,
+  signal exit codes, temp-file cleanup and independent handle usage
+  across tasks;
+- `tests/lifecycle.rs` — the lifecycle contract as executable tests
+  (EOF without `wait`, no output loss at EOF, wait-without-drain
+  deadlock, EOF-before-exit, `pid`/`kill`, `finish`);
+- `tests/fd_census.rs` — Linux `/proc` fd-table invariants (no
+  parent-side slave fds; master fds released on drop).
 
 ```sh
 cargo test
@@ -181,6 +231,20 @@ CI (`.github/workflows/ci.yml`) runs the test suite on all three
 platforms, an MSRV job, clippy/doc lints and the cross-target matrix.
 
 ## Changelog
+
+### 0.3.1
+
+- Lifecycle contract documented (`EOF ≠ exit`, drain-then-wait ordering,
+  drop semantics per platform) and pinned by new tests.
+- `PtyCtl`: added `pid()` and `kill()` (with `None`/error defaults, so
+  existing implementations keep compiling); `Pty` gained `pid()`/`kill()`
+  passthroughs and a drain-first `finish() -> (output, exit_code)`.
+- Windows: `wait` now uses a dedicated waiter thread instead of a
+  tokio blocking-pool thread parked on `WaitForSingleObject` — long-lived
+  sessions no longer consume blocking-pool capacity (default cap 512).
+- Fixed the library's tokio feature set: `io-util` was missing for the
+  new `finish()` (compilation of the lib alone previously relied on
+  dev-dependency feature unification).
 
 ### 0.3.0
 

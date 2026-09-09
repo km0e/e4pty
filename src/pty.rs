@@ -2,9 +2,9 @@
 //! every backend must fulfill.
 
 use async_trait::async_trait;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 
-use crate::Result;
+use crate::{Error, Result};
 
 /// Desired terminal dimensions for a freshly created pty.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,7 +69,42 @@ pub trait PtyCtl: Send + Sync + Unpin {
     /// `128 + signal` (e.g. `SIGTERM` → 143); a normal exit yields the
     /// `exit(2)` status. The wait is truly asynchronous — it never blocks
     /// the executor's worker threads.
+    ///
+    /// This resolves when the *spawned child process* is reaped —
+    /// independently of the reader's EOF: it may complete while the reader
+    /// still has output pending (e.g. a descendant keeping the pty's slave
+    /// side open), and the reader may see EOF while the process is still
+    /// alive (the child closed its own stdio). See the
+    /// [`lifecycle contract`](crate#lifecycle-contract) in the crate docs
+    /// for the teardown order that handles both.
     async fn wait(&mut self) -> Result<i32>;
+
+    /// The OS process id of the spawned child, if the backend can report
+    /// it. Both built-in backends always do; the `None` default exists
+    /// for third-party implementations.
+    fn pid(&self) -> Option<u32> {
+        None
+    }
+
+    /// Initiate termination of the spawned child: `SIGKILL` on Unix,
+    /// `TerminateProcess` (exit code `1`) on Windows. No-op if the child
+    /// has already exited.
+    ///
+    /// This only signals the spawned child — other processes in the pty
+    /// session are not touched. Tear the whole session down by dropping
+    /// the reader and writer handles (closing the master sends `SIGHUP`
+    /// to the foreground process group on Unix; closing the ConPTY
+    /// implicitly ends the session on Windows).
+    ///
+    /// Non-blocking: collect the exit code afterwards with
+    /// [`PtyCtl::wait`] (Unix reports `128 + SIGKILL` = `137`).
+    async fn kill(&mut self) -> Result<()> {
+        let _ = self;
+        Err(Error::IO(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "this pty backend does not support kill",
+        )))
+    }
 }
 
 /// Owned type-erased [`PtyCtl`].
@@ -108,9 +143,53 @@ impl Pty {
         (self.ctl, self.writer, self.reader)
     }
 
+    /// The OS process id of the spawned child, if the backend reports it.
+    pub fn pid(&self) -> Option<u32> {
+        self.ctl.pid()
+    }
+
+    /// Initiate termination of the spawned child; see [`PtyCtl::kill`].
+    ///
+    /// Non-blocking: collect the exit code afterwards with [`Pty::wait`].
+    pub async fn kill(&mut self) -> Result<()> {
+        self.ctl.kill().await
+    }
+
     /// Convenience passthrough to [`PtyCtl::wait`].
     pub async fn wait(&mut self) -> Result<i32> {
         self.ctl.wait().await
+    }
+
+    /// Consume the pty, drain the reader to EOF and collect the exit code.
+    ///
+    /// Batch-mode convenience that implements the safe teardown order
+    /// (see the [`lifecycle contract`](crate#lifecycle-contract)): the
+    /// reader is drained *first* — a child blocked writing to a full tty
+    /// output buffer would otherwise never exit, and a `wait`-first call
+    /// would deadlock — while `wait` runs concurrently so children that
+    /// close their stdio early are still reaped. Returns
+    /// `(output, exit_code)`.
+    ///
+    /// This completes only when the reader sees EOF: descendants that
+    /// keep the pty's slave side open postpone it past `wait`, and a
+    /// child that blocks *reading* input never produces it — end the
+    /// input with `0x04` (canonical-mode EOT) or [`PtyWriter::eof`]
+    /// (Windows) instead.
+    pub async fn finish(self) -> Result<(Vec<u8>, i32)> {
+        let (mut ctl, writer, mut reader) = self.split();
+        // Reap the child concurrently; the drain below is the sequencing
+        // authority and also unblocks children stuck writing.
+        let waiter = tokio::spawn(async move { ctl.wait().await });
+        // Done writing. On Windows this also EOFs the child's stdin (the
+        // writer thread drops the conin handle); on Unix a tty master
+        // cannot be half-closed, so it merely releases one master dup.
+        drop(writer);
+        let mut out = Vec::new();
+        reader.read_to_end(&mut out).await?;
+        let code = waiter
+            .await
+            .map_err(|join| Error::IO(std::io::Error::other(join)))??;
+        Ok((out, code))
     }
 }
 

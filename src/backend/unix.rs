@@ -28,6 +28,7 @@ use crate::spawn::SpawnSpec;
 /// Truly asynchronous wait handle around the tokio child.
 struct UnixCtl {
     child: Child,
+    pid: Option<u32>,
 }
 
 #[async_trait]
@@ -41,6 +42,18 @@ impl PtyCtl for UnixCtl {
         Ok(es
             .code()
             .unwrap_or_else(|| es.signal().map_or(1, |v| 128 + v)))
+    }
+
+    fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+
+    async fn kill(&mut self) -> Result<()> {
+        // `start_kill` sends SIGKILL and is a no-op once the child was
+        // reaped (i.e. after `wait` completed). Collect the exit code
+        // (`128 + SIGKILL` = 137) with `wait`.
+        self.child.start_kill()?;
+        Ok(())
     }
 }
 
@@ -219,7 +232,16 @@ pub(crate) fn openpty(spec: SpawnSpec) -> Result<Pty> {
     }
     // TODO: set signal handler
 
+    // EOF-liveness invariant: every parent-side copy of the slave (the
+    // three `Stdio` dups above and the `pair.user` original moved into the
+    // `pre_exec` closure below) is owned by the `Command` and therefore
+    // dies with the temporary when it is dropped at the end of the spawn
+    // statement. If a refactor ever keeps that `Command` alive, `read` on
+    // the master would no longer observe EOF when the child exits.
+    // Regression-tested by `tests/lifecycle.rs::eof_without_wait` and
+    // `tests/fd_census.rs::parent_slave_fds_and_master_fd_release`.
     let child = tokio::process::Command::from(builder).spawn()?;
+    let pid = child.id();
 
     use rustix::io;
     // Writer fd: duplicate of the master, CLOEXEC so it never leaks into
@@ -242,7 +264,11 @@ pub(crate) fn openpty(spec: SpawnSpec) -> Result<Pty> {
         fd: AsyncFd::new(rfile)?,
     };
 
-    Ok(Pty::new(UnixCtl { child }, writer, reader))
+    Ok(Pty::new(
+        UnixCtl { child, pid },
+        writer,
+        reader,
+    ))
 }
 
 /// Switch a pty master fd to non-blocking mode (required by `AsyncFd`).

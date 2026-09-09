@@ -11,6 +11,9 @@
 //!   `ResizePseudoConsole` calls. An `Eof` message breaks the loop; the
 //!   thread then drops the conin handle, which is what signals EOF to
 //!   the child's stdin.
+//! - a **waiter thread** parks on the child process handle and publishes
+//!   the exit code for `wait` (keeps `INFINITE` waits off the tokio
+//!   blocking pool, which a session-per-thread would exhaust).
 //!
 //! Because pipe/ConPTY access is confined to those threads and the
 //! ConPTY handle lives behind an `Arc<Mutex<Option<HPCON>>>` that is
@@ -29,7 +32,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 use tracing::debug;
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, MAX_PATH};
@@ -104,14 +107,77 @@ impl Drop for SafeHandle {
 unsafe impl Send for SafeHandle {}
 unsafe impl Sync for SafeHandle {}
 
-/// Control half: owns the process handle and the shared ConPTY state.
+/// Shared exit status of the spawned child, produced by the dedicated
+/// waiter thread and consumed by [`WinCtl::wait`].
+struct ExitState {
+    code: Mutex<Option<i32>>,
+    notify: Notify,
+}
+
+impl ExitState {
+    fn new() -> Self {
+        Self {
+            code: Mutex::new(None),
+            notify: Notify::new(),
+        }
+    }
+
+    fn set(&self, code: i32) {
+        *self.code.lock().unwrap() = Some(code);
+        self.notify.notify_waiters();
+    }
+
+    fn has_code(&self) -> bool {
+        self.code.lock().unwrap().is_some()
+    }
+
+    /// The cached exit code, or wait for the waiter thread's
+    /// notification. The future is registered (`enable`) before the
+    /// check, so a concurrent `set` cannot be missed.
+    async fn get(&self) -> i32 {
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if let Some(code) = *self.code.lock().unwrap() {
+            return code;
+        }
+        notified.await;
+        self.code.lock().unwrap().expect("set before notify_waiters")
+    }
+}
+
+/// Blocking wait loop: parks a dedicated thread on the process handle
+/// (the same one-thread-per-session model as the ConPTY I/O threads) and
+/// publishes the exit code. A tokio blocking-pool thread is deliberately
+/// *not* used: one `INFINITE` wait per session would exhaust the pool's
+/// default cap (512 threads) on long-lived sessions.
+fn wait_thread(process: SafeHandle, exit: Arc<ExitState>) {
+    unsafe { WaitForSingleObject(process.get(), INFINITE) };
+    let mut raw = 0u32;
+    let code = match unsafe { GetExitCodeProcess(process.get(), &mut raw as *mut u32) } {
+        Ok(()) => raw as i32,
+        Err(e) => {
+            debug!("GetExitCodeProcess failed: {e}; reporting 1");
+            1
+        }
+    };
+    debug!("exit code: {}", code);
+    exit.set(code);
+}
+
+/// Control half: owns the shared ConPTY state and the child's exit
+/// state.
 ///
-/// Dropping it closes the pseudoconsole. On ConPTY semantics this also
-/// signals the attached client processes, which is why no explicit
-/// `TerminateProcess` is needed.
+/// The process handle itself is owned by the dedicated waiter thread
+/// (see [`wait_thread`]); this half only tracks the pid and the exit
+/// code. Dropping it closes the pseudoconsole. On ConPTY semantics this
+/// also signals the attached client processes, which unblocks the
+/// waiter thread even when `wait` was never called — no explicit
+/// `TerminateProcess` is needed for teardown.
 struct WinCtl {
-    process: SafeHandle,
+    pid: u32,
     conpty: Arc<ConptyCore>,
+    exit: Arc<ExitState>,
 }
 
 impl Drop for WinCtl {
@@ -123,20 +189,30 @@ impl Drop for WinCtl {
 #[async_trait]
 impl PtyCtl for WinCtl {
     async fn wait(&mut self) -> Result<i32> {
-        // Copy the raw handle as an `isize` (`HANDLE` wraps a raw pointer
-        // and is `!Send`); `self.process` stays the owner and closer.
-        let process = self.process.get().0 as isize;
-        let code = tokio::task::spawn_blocking(move || -> windows::core::Result<i32> {
-            let process = HANDLE(process as *mut core::ffi::c_void);
-            unsafe { WaitForSingleObject(process, INFINITE) };
-            let mut code: u32 = 0;
-            unsafe { GetExitCodeProcess(process, &mut code as *mut u32) }?;
-            debug!("exit code: {}", code);
-            Ok(code as i32)
-        })
-        .await
-        .map_err(|e| Error::new(ErrorKind::Other, e))??;
-        Ok(code)
+        Ok(self.exit.get().await)
+    }
+
+    fn pid(&self) -> Option<u32> {
+        Some(self.pid)
+    }
+
+    async fn kill(&mut self) -> Result<()> {
+        // Idempotent: once the waiter thread published the code, there is
+        // nothing left to terminate.
+        if self.exit.has_code() {
+            return Ok(());
+        }
+        // Reopen by pid: the only long-lived handle belongs to the waiter
+        // thread, so `WinCtl` stays lightweight and `Drop`-simple.
+        let process = unsafe { OpenProcess(PROCESS_TERMINATE, false, self.pid) }
+            .map_err(crate::Error::from)?;
+        let process = SafeHandle::from(process);
+        match unsafe { TerminateProcess(process.get(), 1) } {
+            Ok(()) => Ok(()),
+            // Raced with a concurrent exit: the code is in, that's fine.
+            Err(_) if self.exit.has_code() => Ok(()),
+            Err(e) => Err(crate::Error::from(e)),
+        }
     }
 }
 
@@ -397,6 +473,17 @@ pub(crate) fn openpty(spec: SpawnSpec) -> Result<Pty> {
     let thread = SafeHandle::from(proc_info.hThread);
     drop(thread);
 
+    let pid = unsafe { GetProcessId(proc_info.hProcess) };
+    let exit = Arc::new(ExitState::new());
+    // Dedicated waiter thread: takes ownership of the only process
+    // handle, parks until the child exits and publishes the code for
+    // `WinCtl::wait` (see the module docs for why not `spawn_blocking`).
+    // (`SafeHandle` first: raw `HANDLE` is `!Send` and cannot cross into
+    // the closure.)
+    let process = SafeHandle::from(proc_info.hProcess);
+    let exit_for_thread = Arc::clone(&exit);
+    std::thread::spawn(move || wait_thread(process, exit_for_thread));
+
     let conpty = Arc::new(ConptyCore {
         hpcon: Mutex::new(Some(pty_handle)),
     });
@@ -417,8 +504,9 @@ pub(crate) fn openpty(spec: SpawnSpec) -> Result<Pty> {
 
     Ok(Pty::new(
         WinCtl {
-            process: SafeHandle::from(proc_info.hProcess),
+            pid,
             conpty,
+            exit,
         },
         WinWriter { tx: in_tx },
         WinReader {
