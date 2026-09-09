@@ -87,7 +87,14 @@ async fn no_output_loss_before_eof() {
     // blanks can be interleaved, so count numeric payload lines only.
     let text = String::from_utf8_lossy(&out);
     let numbers: Vec<u64> = text.lines().filter_map(|l| l.trim().parse().ok()).collect();
-    assert_eq!(numbers.len(), 50000, "lines lost");
+    if numbers.len() != 50000 {
+        let set: std::collections::HashSet<u64> = numbers.iter().copied().collect();
+        let missing: Vec<u64> = (1..=50000).filter(|n| !set.contains(n)).take(8).collect();
+        panic!(
+            "lines lost: got {} of 50000, first missing: {missing:?}",
+            numbers.len()
+        );
+    }
     assert_eq!(numbers[0], 1, "head lost");
     assert_eq!(numbers[49999], 50000, "tail lost");
 }

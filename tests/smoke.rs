@@ -117,6 +117,22 @@ async fn smoke_current_dir() {
     let code = pty.wait().await.expect("wait failed");
     let text = String::from_utf8_lossy(&out);
     assert_eq!(code, 0);
+    // Windows: msys `pwd` prints POSIX-style paths (`/c/...`), while the
+    // canonicalized dir comes back as `\\?\C:\...` — convert for the
+    // comparison and use `contains` (the output carries VT noise).
+    #[cfg(windows)]
+    {
+        let s = dir.to_string_lossy();
+        let s = s.trim_start_matches(r"\\?\");
+        let drive = s.chars().next().unwrap().to_ascii_lowercase();
+        let rest: String = s.chars().skip(2).collect();
+        let msys = format!("/{drive}{}", rest.replace('\\', "/"));
+        assert!(
+            text.contains(&msys),
+            "cwd not applied, got {text:?} want {msys:?}"
+        );
+    }
+    #[cfg(not(windows))]
     assert!(
         text.trim().ends_with(&dir.to_string_lossy().to_string()),
         "cwd not applied, got {text:?} want {dir:?}"

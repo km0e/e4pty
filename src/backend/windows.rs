@@ -185,6 +185,12 @@ fn wait_thread(process: SafeHandle, conpty: Arc<ConptyCore>, exit: Arc<ExitState
     // EOF after the child exits and readers hang forever (observed on
     // windows-latest). Closing it here delivers reader EOF at child exit,
     // mirroring the Unix backend. Idempotent: races with `WinCtl::drop`.
+    //
+    // The close races conhost's last render tick: without a grace period
+    // the tail of the output can be lost with it. Data already written to
+    // the pipe survives the close, so this only bounds the window.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    trace!("waiter: closing ConPTY");
     conpty.close();
 }
 
@@ -590,6 +596,7 @@ fn writer_thread(
 fn reader_thread(pipe: SafeHandle, tx: mpsc::Sender<Vec<u8>>) {
     let mut buf = [0u8; 8192];
     let mut chunks = 0u64;
+    let mut total = 0u64;
     loop {
         let mut bytes = 0u32;
         let res = unsafe { ReadFile(pipe.get(), Some(&mut buf), Some(&mut bytes), None) };
@@ -597,6 +604,7 @@ fn reader_thread(pipe: SafeHandle, tx: mpsc::Sender<Vec<u8>>) {
             Ok(()) if bytes > 0 => {
                 debug!("read {} bytes", bytes);
                 chunks += 1;
+                total += bytes as u64;
                 if tx.blocking_send(buf[..bytes as usize].to_vec()).is_err() {
                     // Receiver dropped: nothing left to report to.
                     trace!("reader: receiver dropped");
@@ -605,7 +613,9 @@ fn reader_thread(pipe: SafeHandle, tx: mpsc::Sender<Vec<u8>>) {
             }
             _ => {
                 // 0 bytes or error: console closed → EOF
-                trace!("reader: ReadFile -> {res:?} (bytes={bytes}) after {chunks} chunks");
+                trace!(
+                    "reader: ReadFile -> {res:?} (bytes={bytes}) after {chunks} chunks, {total} bytes"
+                );
                 break;
             }
         }
