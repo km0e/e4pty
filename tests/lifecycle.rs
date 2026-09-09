@@ -83,15 +83,13 @@ async fn no_output_loss_before_eof() {
         .expect("wait timed out")
         .expect("wait failed");
     assert_eq!(code, 0);
-    // ConPTY may hand us trailing empty lines alongside the payload.
+    // ConPTY output is a rendered stream: VT-sequence lines and trailing
+    // blanks can be interleaved, so count numeric payload lines only.
     let text = String::from_utf8_lossy(&out);
-    let lines: Vec<&str> = text
-        .lines()
-        .map(str::trim_end)
-        .filter(|l| !l.is_empty())
-        .collect();
-    assert_eq!(lines.len(), 50000, "lines lost");
-    assert_eq!(lines.last().unwrap().trim(), "50000", "tail lost");
+    let numbers: Vec<u64> = text.lines().filter_map(|l| l.trim().parse().ok()).collect();
+    assert_eq!(numbers.len(), 50000, "lines lost");
+    assert_eq!(numbers[0], 1, "head lost");
+    assert_eq!(numbers[49999], 50000, "tail lost");
 }
 
 /// `wait` without draining deadlocks: a chatty child fills the tty output
@@ -244,26 +242,23 @@ async fn finish_collects_output_and_code() {
 }
 
 /// `finish` drains first: a chatty child that would deadlock a
-/// wait-first consumer completes normally.
+/// wait-first consumer completes normally. (100k lines: enough to
+/// overflow any console buffer, small enough for ConPTY's VT renderer.)
 #[tokio::test]
 async fn finish_drains_chatty_child() {
     let pty = openpty(
         WindowSize::default(),
-        Script::exec("sh", ["-c", "seq 1 200000; sleep 1; exit 7"]),
+        Script::exec("sh", ["-c", "seq 1 100000; sleep 1; exit 7"]),
     )
     .expect("openpty failed");
-    let (out, code) = tokio::time::timeout(Duration::from_secs(30), pty.finish())
+    let (out, code) = tokio::time::timeout(Duration::from_secs(120), pty.finish())
         .await
         .expect("finish timed out")
         .expect("finish failed");
     assert_eq!(code, 7);
-    // ConPTY may hand us trailing empty lines alongside the payload.
     let text = String::from_utf8_lossy(&out);
-    let lines: Vec<&str> = text
-        .lines()
-        .map(str::trim_end)
-        .filter(|l| !l.is_empty())
-        .collect();
-    assert_eq!(lines.len(), 200000);
-    assert_eq!(lines.last().unwrap().trim(), "200000");
+    let numbers: Vec<u64> = text.lines().filter_map(|l| l.trim().parse().ok()).collect();
+    assert_eq!(numbers.len(), 100000);
+    assert_eq!(numbers[0], 1, "head lost");
+    assert_eq!(numbers[99999], 100000, "tail lost");
 }

@@ -103,11 +103,11 @@ async fn smoke_current_dir() {
     // canonicalize so `pwd` (physical cwd) matches even when the temp dir
     // itself is reached through a symlink (macOS /tmp → /private/tmp).
     let dir = std::env::temp_dir().canonicalize().unwrap();
-    // Same macOS instant-exit consideration as `smoke_line_form`.
-    #[cfg(target_os = "macos")]
+    // Instant-exit children can race their own final output: macOS/BSD
+    // flushes the pty queues at slave close, and on Windows the ConPTY is
+    // closed when the spawned child exits (render-to-pipe lag). Keep the
+    // session briefly alive on every platform.
     let script = Script::exec("sh", ["-c", "pwd; sleep 0.2"]);
-    #[cfg(not(target_os = "macos"))]
-    let script = Script::line("pwd");
     let mut pty = PtyBuilder::new(WindowSize::default(), script)
         .current_dir(&dir)
         .spawn()
@@ -144,17 +144,21 @@ async fn smoke_env_set_and_inherit() {
 
 #[tokio::test]
 async fn smoke_env_remove() {
+    // A neutral variable instead of `HOME`: msys environments (Windows)
+    // re-derive HOME themselves, so removing it would not be observable.
+    // Setting it in-process is safe under the serial test run.
+    unsafe { std::env::set_var("E4PTY_REMOVE_ME", "1") };
     let mut pty = PtyBuilder::new(
         WindowSize::default(),
         Script::exec(
             "sh",
             [
                 "-c",
-                "[ -z \"$HOME\" ] && echo home-gone || echo home-still-there",
+                "[ -z \"$E4PTY_REMOVE_ME\" ] && echo gone || echo still-there",
             ],
         ),
     )
-    .env_remove("HOME")
+    .env_remove("E4PTY_REMOVE_ME")
     .spawn()
     .expect("openpty failed");
     let mut out = Vec::new();
@@ -162,7 +166,7 @@ async fn smoke_env_remove() {
     let code = pty.wait().await.expect("wait failed");
     let text = String::from_utf8_lossy(&out);
     assert_eq!(code, 0);
-    assert!(text.contains("home-gone"), "env_remove failed: {text:?}");
+    assert!(text.contains("gone"), "env_remove failed: {text:?}");
 }
 
 #[tokio::test]
@@ -209,9 +213,15 @@ async fn smoke_temp_script_self_cleanup() {
 #[tokio::test]
 async fn smoke_split_handles() {
     // `Pty::split` must yield independently usable handles: drive reader
-    // and ctl from different tasks while writing from this one.
+    // and ctl from different tasks while writing from this one. The child
+    // reads a line and echoes it, then exits on its own — no EOT needed
+    // (0x04 is a Unix line-discipline convention that conhost ignores).
     let _g = TMP_LOCK.lock().await;
-    let pty = openpty(WindowSize::default(), Script::sh("cat; exit 0")).expect("openpty failed");
+    let pty = openpty(
+        WindowSize::default(),
+        Script::exec("sh", ["-c", "read line; echo got:$line; exit 0"]),
+    )
+    .expect("openpty failed");
     let (mut ctl, mut writer, mut reader) = pty.split();
 
     let reader_task = tokio::spawn(async move {
@@ -225,13 +235,10 @@ async fn smoke_split_handles() {
         .write_all(b"split-handles\r\n")
         .await
         .expect("write failed");
-    // `cat` is in canonical mode: EOT (Ctrl+D) ends its stdin read.
-    writer.write_all(b"\x04").await.expect("write EOT failed");
-    // Drop the writer dup afterwards; the reader fd keeps the pty alive
-    // until `cat` exits and the master reports EOF/EIO.
+    // The script exits after echoing, which ends the session.
     drop(writer);
 
     let out = reader_task.await.expect("reader task panicked");
-    assert!(out.contains("split-handles"), "output: {out:?}");
+    assert!(out.contains("got:split-handles"), "output: {out:?}");
     assert_eq!(ctl_task.await.expect("ctl task panicked"), 0);
 }
