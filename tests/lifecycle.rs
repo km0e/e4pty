@@ -42,6 +42,49 @@ fn kill_stray_sleeps() {
     }
 }
 
+/// Strip ANSI/VT escape sequences (CSI + OSC) from a ConPTY render
+/// stream: the first render batch merges the screen-clear/home sequences
+/// into the same `\n`-delimited lines as the first payload rows, which
+/// would otherwise break line-based parsing (\"ESC[H1\" parses as junk).
+fn strip_vt(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('[') => {
+                chars.next();
+                // CSI: consume up to and including the final byte 0x40..=0x7e.
+                while let Some(&c2) = chars.peek() {
+                    chars.next();
+                    if ('\u{40}'..='\u{7e}').contains(&c2) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next();
+                // OSC: consume up to BEL or ST (ESC \).
+                loop {
+                    match chars.next() {
+                        Some('\u{7}') | None => break,
+                        Some('\u{1b}') => {
+                            chars.next();
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {} // lone ESC or two-char escape: drop the ESC only
+        }
+    }
+    out
+}
+
 /// A read-only consumer that never calls `wait` still receives EOF when
 /// the child exits. This pins the EOF-liveness invariant: after spawn the
 /// parent holds no slave fd copies (see `parent_holds_no_slave_fds`), so
@@ -85,7 +128,7 @@ async fn no_output_loss_before_eof() {
     assert_eq!(code, 0);
     // ConPTY output is a rendered stream: VT-sequence lines and trailing
     // blanks can be interleaved, so count numeric payload lines only.
-    let text = String::from_utf8_lossy(&out);
+    let text = strip_vt(&String::from_utf8_lossy(&out));
     let numbers: Vec<u64> = text.lines().filter_map(|l| l.trim().parse().ok()).collect();
     if numbers.len() != 50000 {
         let set: std::collections::HashSet<u64> = numbers.iter().copied().collect();
@@ -263,7 +306,7 @@ async fn finish_drains_chatty_child() {
         .expect("finish timed out")
         .expect("finish failed");
     assert_eq!(code, 7);
-    let text = String::from_utf8_lossy(&out);
+    let text = strip_vt(&String::from_utf8_lossy(&out));
     let numbers: Vec<u64> = text.lines().filter_map(|l| l.trim().parse().ok()).collect();
     assert_eq!(numbers.len(), 100000);
     assert_eq!(numbers[0], 1, "head lost");
