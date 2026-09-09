@@ -242,6 +242,18 @@ platforms, an MSRV job, clippy/doc lints and the cross-target matrix.
 - Windows: `wait` now uses a dedicated waiter thread instead of a
   tokio blocking-pool thread parked on `WaitForSingleObject` — long-lived
   sessions no longer consume blocking-pool capacity (default cap 512).
+- Windows: `CreateProcessW` now sets `CREATE_UNICODE_ENVIRONMENT` for the
+  UTF-16 environment block — custom environments (`PtyBuilder::env`/
+  `envs`/`env_remove`/`env_clear`) previously failed to spawn outright.
+- Windows: the pseudoconsole is closed when the spawned child exits, so
+  readers observe EOF. The console server lives as long as the HPCON
+  handle, not the client: without the close, `ReadFile(conout)` blocked
+  forever after child exit. A short grace period before the close avoids
+  losing conhost's final render tick.
+- Documented: closing the ConPTY input pipe (writer drop /
+  `PtyWriter::eof`) is a console-close signal under ConPTY — attached
+  clients are terminated (`STATUS_CONTROL_C_EXIT`) rather than merely
+  observing stdin EOF.
 - Fixed the library's tokio feature set: `io-util` was missing for the
   new `finish()` (compilation of the lib alone previously relied on
   dev-dependency feature unification).
