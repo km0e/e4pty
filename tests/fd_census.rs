@@ -1,7 +1,6 @@
-//! fd-table census for the Unix backend (Linux only, uses `/proc/self/fd`).
-//!
-//! Lives in its own test binary so the counts are not polluted by ptys
-//! held open by other tests running in parallel.
+//! fd-table census for the Unix backend. Linux only (`/proc`); gated at
+//! the crate level so other platforms see an empty test binary.
+#![cfg(target_os = "linux")]
 
 use e4pty::prelude::*;
 

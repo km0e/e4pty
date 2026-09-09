@@ -164,7 +164,7 @@ impl ExitState {
 /// default cap (512 threads) on long-lived sessions.
 fn wait_thread(process: SafeHandle, exit: Arc<ExitState>) {
     unsafe { WaitForSingleObject(process.get(), INFINITE) };
-    trace!("waiter: child handle signalled");
+    trace("waiter: child handle signalled");
     let mut raw = 0u32;
     let code = match unsafe { GetExitCodeProcess(process.get(), &mut raw as *mut u32) } {
         Ok(()) => raw as i32,
@@ -173,7 +173,7 @@ fn wait_thread(process: SafeHandle, exit: Arc<ExitState>) {
             1
         }
     };
-    trace!("waiter: child exited, code {code}");
+    trace("waiter: child exited, code {code}");
     debug!("exit code: {}", code);
     exit.set(code);
 }
@@ -195,7 +195,7 @@ struct WinCtl {
 
 impl Drop for WinCtl {
     fn drop(&mut self) {
-        trace!("ctl dropped: closing ConPTY");
+        trace("ctl dropped: closing ConPTY");
         self.conpty.close();
     }
 }
@@ -488,7 +488,7 @@ pub(crate) fn openpty(spec: SpawnSpec) -> Result<Pty> {
     drop(thread);
 
     let pid = unsafe { GetProcessId(proc_info.hProcess) };
-    trace!("spawned pid {pid}");
+    trace("spawned pid {pid}");
     let exit = Arc::new(ExitState::new());
     // Dedicated waiter thread: takes ownership of the only process
     // handle, parks until the child exits and publishes the code for
@@ -546,7 +546,7 @@ fn writer_thread(
                     match res {
                         Ok(()) if written > 0 => offset += written as usize,
                         _ => {
-                            trace!("writer: WriteFile broken, exiting");
+                            trace("writer: WriteFile broken, exiting");
                             return; // pipe broken: console is gone
                         }
                     }
@@ -556,12 +556,12 @@ fn writer_thread(
                 let _ = conpty.resize(WindowSize { rows, cols });
             }
             WriterMsg::Eof => {
-                trace!("writer: Eof message, dropping conin");
+                trace("writer: Eof message, dropping conin");
                 break;
             }
         }
     }
-    trace!("writer thread exiting");
+    trace("writer thread exiting");
     // Dropping `pipe` (CloseHandle) is what delivers EOF to the child.
 }
 
@@ -579,18 +579,18 @@ fn reader_thread(pipe: SafeHandle, tx: mpsc::Sender<Vec<u8>>) {
                 chunks += 1;
                 if tx.blocking_send(buf[..bytes as usize].to_vec()).is_err() {
                     // Receiver dropped: nothing left to report to.
-                    trace!("reader: receiver dropped");
+                    trace("reader: receiver dropped");
                     break;
                 }
             }
             _ => {
                 // 0 bytes or error: console closed → EOF
-                trace!("reader: ReadFile -> {res:?} (bytes={bytes}) after {chunks} chunks");
+                trace("reader: ReadFile -> {res:?} (bytes={bytes}) after {chunks} chunks");
                 break;
             }
         }
     }
-    trace!("reader thread exiting");
+    trace("reader thread exiting");
 }
 
 /// Build a `NAME=VALUE\0…\0` UTF-16 environment block for
