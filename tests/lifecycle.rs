@@ -30,7 +30,9 @@ fn pgrep(pattern: &str) -> bool {
 fn kill_stray_sleeps() {
     #[cfg(unix)]
     {
-        let _ = std::process::Command::new("pkill").args(["-x", "sleep"]).status();
+        let _ = std::process::Command::new("pkill")
+            .args(["-x", "sleep"])
+            .status();
     }
     #[cfg(windows)]
     {
@@ -46,8 +48,11 @@ fn kill_stray_sleeps() {
 /// EOF depends only on the child's session.
 #[tokio::test]
 async fn eof_without_wait() {
-    let pty = openpty(WindowSize::default(), Script::exec("sh", ["-c", "echo probe1; exit 0"]))
-        .expect("openpty failed");
+    let pty = openpty(
+        WindowSize::default(),
+        Script::exec("sh", ["-c", "echo probe1; sleep 0.2; exit 0"]),
+    )
+    .expect("openpty failed");
     let (_ctl, _writer, mut reader) = pty.split();
     let mut out = Vec::new();
     tokio::time::timeout(Duration::from_secs(10), reader.read_to_end(&mut out))
@@ -64,7 +69,7 @@ async fn eof_without_wait() {
 async fn no_output_loss_before_eof() {
     let pty = openpty(
         WindowSize::default(),
-        Script::exec("sh", ["-c", "seq 1 50000; exit 0"]),
+        Script::exec("sh", ["-c", "seq 1 50000; sleep 1; exit 0"]),
     )
     .expect("openpty failed");
     let (mut ctl, _writer, mut reader) = pty.split();
@@ -141,8 +146,11 @@ async fn wait_can_resolve_before_reader_eof() {
 
     // Probe EOF while the grandchild still holds the slave fds.
     let mut scratch = Vec::new();
-    let eof = tokio::time::timeout(Duration::from_millis(1500), reader.read_to_end(&mut scratch))
-        .await;
+    let eof = tokio::time::timeout(
+        Duration::from_millis(1500),
+        reader.read_to_end(&mut scratch),
+    )
+    .await;
     let grandchild_alive = pgrep("sleep 30");
     kill_stray_sleeps();
     let _ = reader.read_to_end(&mut Vec::new()).await;
@@ -183,15 +191,18 @@ async fn eof_can_resolve_before_child_exit() {
     // Linux the exec'd `sleep` reliably survives closing its stdio.)
     let wait = tokio::time::timeout(Duration::from_millis(1500), ctl.wait()).await;
     kill_stray_sleeps();
-    assert!(wait.is_err(), "wait() returned although the child is still alive");
+    assert!(
+        wait.is_err(),
+        "wait() returned although the child is still alive"
+    );
 }
 
 /// `pid` is reported and `kill` terminates the child: Unix reports
 /// `128 + SIGKILL` = 137, Windows reports the `TerminateProcess` code 1.
 #[tokio::test]
 async fn pid_and_kill() {
-    let mut pty = openpty(WindowSize::default(), Script::exec("sleep", ["30"]))
-        .expect("openpty failed");
+    let mut pty =
+        openpty(WindowSize::default(), Script::exec("sleep", ["30"])).expect("openpty failed");
     let pid = pty.pid().expect("backend did not report a pid");
     assert!(pid > 0, "bogus pid {pid}");
     tokio::time::timeout(Duration::from_secs(5), pty.kill())
@@ -210,7 +221,7 @@ async fn pid_and_kill() {
 async fn finish_collects_output_and_code() {
     let pty = openpty(
         WindowSize::default(),
-        Script::exec("sh", ["-c", "echo finish-me; exit 3"]),
+        Script::exec("sh", ["-c", "echo finish-me; sleep 0.2; exit 3"]),
     )
     .expect("openpty failed");
     let (out, code) = tokio::time::timeout(Duration::from_secs(10), pty.finish())
@@ -227,7 +238,7 @@ async fn finish_collects_output_and_code() {
 async fn finish_drains_chatty_child() {
     let pty = openpty(
         WindowSize::default(),
-        Script::exec("sh", ["-c", "seq 1 200000; exit 7"]),
+        Script::exec("sh", ["-c", "seq 1 200000; sleep 1; exit 7"]),
     )
     .expect("openpty failed");
     let (out, code) = tokio::time::timeout(Duration::from_secs(30), pty.finish())

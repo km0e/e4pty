@@ -32,7 +32,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{Notify, mpsc};
 use tracing::debug;
 
 use windows::Win32::Foundation::{CloseHandle, HANDLE, MAX_PATH};
@@ -45,6 +45,14 @@ use windows::core::*;
 use crate::error::Result;
 use crate::pty::{Pty, PtyCtl, PtyReader, PtyWriter, WindowSize};
 use crate::spawn::SpawnSpec;
+
+/// Lifecycle tracing for field diagnostics (`E4PTY_DEBUG=1`): prints to
+/// stderr so `cargo test -- --nocapture` shows where a session stalls.
+fn trace(msg: impl std::fmt::Display) {
+    if std::env::var_os("E4PTY_DEBUG").is_some() {
+        eprintln!("[e4pty] {msg}");
+    }
+}
 
 /// Messages flowing from the async [`PtyWriter`] to the writer thread.
 enum WriterMsg {
@@ -142,7 +150,10 @@ impl ExitState {
             return code;
         }
         notified.await;
-        self.code.lock().unwrap().expect("set before notify_waiters")
+        self.code
+            .lock()
+            .unwrap()
+            .expect("set before notify_waiters")
     }
 }
 
@@ -153,6 +164,7 @@ impl ExitState {
 /// default cap (512 threads) on long-lived sessions.
 fn wait_thread(process: SafeHandle, exit: Arc<ExitState>) {
     unsafe { WaitForSingleObject(process.get(), INFINITE) };
+    trace!("waiter: child handle signalled");
     let mut raw = 0u32;
     let code = match unsafe { GetExitCodeProcess(process.get(), &mut raw as *mut u32) } {
         Ok(()) => raw as i32,
@@ -161,6 +173,7 @@ fn wait_thread(process: SafeHandle, exit: Arc<ExitState>) {
             1
         }
     };
+    trace!("waiter: child exited, code {code}");
     debug!("exit code: {}", code);
     exit.set(code);
 }
@@ -182,6 +195,7 @@ struct WinCtl {
 
 impl Drop for WinCtl {
     fn drop(&mut self) {
+        trace!("ctl dropped: closing ConPTY");
         self.conpty.close();
     }
 }
@@ -474,6 +488,7 @@ pub(crate) fn openpty(spec: SpawnSpec) -> Result<Pty> {
     drop(thread);
 
     let pid = unsafe { GetProcessId(proc_info.hProcess) };
+    trace!("spawned pid {pid}");
     let exit = Arc::new(ExitState::new());
     // Dedicated waiter thread: takes ownership of the only process
     // handle, parks until the child exits and publishes the code for
@@ -503,11 +518,7 @@ pub(crate) fn openpty(spec: SpawnSpec) -> Result<Pty> {
     std::thread::spawn(move || reader_thread(conout, out_tx));
 
     Ok(Pty::new(
-        WinCtl {
-            pid,
-            conpty,
-            exit,
-        },
+        WinCtl { pid, conpty, exit },
         WinWriter { tx: in_tx },
         WinReader {
             rx: out_rx,
@@ -534,16 +545,23 @@ fn writer_thread(
                     };
                     match res {
                         Ok(()) if written > 0 => offset += written as usize,
-                        _ => return, // pipe broken: console is gone
+                        _ => {
+                            trace!("writer: WriteFile broken, exiting");
+                            return; // pipe broken: console is gone
+                        }
                     }
                 }
             }
             WriterMsg::Resize { cols, rows } => {
                 let _ = conpty.resize(WindowSize { rows, cols });
             }
-            WriterMsg::Eof => break,
+            WriterMsg::Eof => {
+                trace!("writer: Eof message, dropping conin");
+                break;
+            }
         }
     }
+    trace!("writer thread exiting");
     // Dropping `pipe` (CloseHandle) is what delivers EOF to the child.
 }
 
@@ -551,20 +569,28 @@ fn writer_thread(
 /// the async channel until EOF or the receiver is dropped.
 fn reader_thread(pipe: SafeHandle, tx: mpsc::Sender<Vec<u8>>) {
     let mut buf = [0u8; 8192];
+    let mut chunks = 0u64;
     loop {
         let mut bytes = 0u32;
         let res = unsafe { ReadFile(pipe.get(), Some(&mut buf), Some(&mut bytes), None) };
         match res {
             Ok(()) if bytes > 0 => {
                 debug!("read {} bytes", bytes);
+                chunks += 1;
                 if tx.blocking_send(buf[..bytes as usize].to_vec()).is_err() {
                     // Receiver dropped: nothing left to report to.
+                    trace!("reader: receiver dropped");
                     break;
                 }
             }
-            _ => break, // 0 bytes or error: console closed → EOF
+            _ => {
+                // 0 bytes or error: console closed → EOF
+                trace!("reader: ReadFile -> {res:?} (bytes={bytes}) after {chunks} chunks");
+                break;
+            }
         }
     }
+    trace!("reader thread exiting");
 }
 
 /// Build a `NAME=VALUE\0…\0` UTF-16 environment block for

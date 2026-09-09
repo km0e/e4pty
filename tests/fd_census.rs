@@ -37,7 +37,10 @@ fn is_slave(link: &str) -> bool {
 /// 2. dropping the pty releases every master fd the library created.
 #[tokio::test]
 async fn parent_slave_fds_and_master_fd_release() {
-    let before: Vec<_> = fd_links().into_iter().filter(|(_, l)| is_master(l)).collect();
+    let before: Vec<_> = fd_links()
+        .into_iter()
+        .filter(|(_, l)| is_master(l))
+        .collect();
     let baseline = before.len(); // unrelated ptmx fds may pre-exist
 
     let pty = openpty(WindowSize::default(), Script::exec("sh", ["-c", "sleep 5"]))

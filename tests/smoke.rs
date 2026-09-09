@@ -25,8 +25,14 @@ async fn smoke_basic() {
 #[tokio::test]
 async fn smoke_line_form() {
     // `Script::line` tokenizes and execs directly, no temp file, no shell.
-    let mut pty = openpty(WindowSize::default(), Script::line("echo line-form-works"))
-        .expect("openpty failed");
+    // macOS/BSD flushes pty output queues when an instant-exiting child's
+    // slave side closes, which can race away output written microseconds
+    // before exit — so macOS wraps the echo in a shell that lingers.
+    #[cfg(target_os = "macos")]
+    let script = Script::exec("sh", ["-c", "echo line-form-works; sleep 0.2"]);
+    #[cfg(not(target_os = "macos"))]
+    let script = Script::line("echo line-form-works");
+    let mut pty = openpty(WindowSize::default(), script).expect("openpty failed");
     let mut out = Vec::new();
     pty.reader.read_to_end(&mut out).await.expect("read failed");
     let code = pty.wait().await.expect("wait failed");
@@ -97,7 +103,12 @@ async fn smoke_current_dir() {
     // canonicalize so `pwd` (physical cwd) matches even when the temp dir
     // itself is reached through a symlink (macOS /tmp → /private/tmp).
     let dir = std::env::temp_dir().canonicalize().unwrap();
-    let mut pty = PtyBuilder::new(WindowSize::default(), Script::line("pwd"))
+    // Same macOS instant-exit consideration as `smoke_line_form`.
+    #[cfg(target_os = "macos")]
+    let script = Script::exec("sh", ["-c", "pwd; sleep 0.2"]);
+    #[cfg(not(target_os = "macos"))]
+    let script = Script::line("pwd");
+    let mut pty = PtyBuilder::new(WindowSize::default(), script)
         .current_dir(&dir)
         .spawn()
         .expect("openpty failed");

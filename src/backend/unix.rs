@@ -264,11 +264,7 @@ pub(crate) fn openpty(spec: SpawnSpec) -> Result<Pty> {
         fd: AsyncFd::new(rfile)?,
     };
 
-    Ok(Pty::new(
-        UnixCtl { child, pid },
-        writer,
-        reader,
-    ))
+    Ok(Pty::new(UnixCtl { child, pid }, writer, reader))
 }
 
 /// Switch a pty master fd to non-blocking mode (required by `AsyncFd`).
