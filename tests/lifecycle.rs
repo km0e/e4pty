@@ -69,7 +69,7 @@ async fn eof_without_wait() {
 async fn no_output_loss_before_eof() {
     let pty = openpty(
         WindowSize::default(),
-        Script::exec("sh", ["-c", "seq 1 50000; sleep 1; exit 0"]),
+        Script::exec("sh", ["-c", "sleep 0.2; seq 1 50000; sleep 1; exit 0"]),
     )
     .expect("openpty failed");
     let (mut ctl, _writer, mut reader) = pty.split();
@@ -255,7 +255,7 @@ async fn finish_collects_output_and_code() {
 async fn finish_drains_chatty_child() {
     let pty = openpty(
         WindowSize::default(),
-        Script::exec("sh", ["-c", "seq 1 100000; sleep 1; exit 7"]),
+        Script::exec("sh", ["-c", "sleep 0.2; seq 1 100000; sleep 1; exit 7"]),
     )
     .expect("openpty failed");
     let (out, code) = tokio::time::timeout(Duration::from_secs(120), pty.finish())

@@ -251,8 +251,9 @@ async fn smoke_split_handles() {
         .write_all(b"split-handles\r\n")
         .await
         .expect("write failed");
-    // The script exits after echoing, which ends the session.
-    drop(writer);
+    // Keep the writer alive: dropping it closes conin, which ConPTY treats
+    // as a console-close signal (clients terminated). The script exits on
+    // its own after echoing.
 
     let out = reader_task.await.expect("reader task panicked");
     assert!(out.contains("got:split-handles"), "output: {out:?}");
