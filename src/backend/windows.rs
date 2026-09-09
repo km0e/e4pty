@@ -462,7 +462,15 @@ pub(crate) fn openpty(spec: SpawnSpec) -> Result<Pty> {
     });
     let env_block: Option<Vec<u16>> = spec.env.map(build_env_block);
 
-    let creation_flags = EXTENDED_STARTUPINFO_PRESENT;
+    // `lpEnvironment` is parsed as ANSI unless CREATE_UNICODE_ENVIRONMENT
+    // is set — our block is UTF-16 (built by `build_env_block`). Without
+    // the flag CreateProcessW fails outright for any custom environment
+    // (observed as instant spawn failures on windows-latest).
+    let creation_flags = if env_block.is_some() {
+        EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT
+    } else {
+        EXTENDED_STARTUPINFO_PRESENT
+    };
     let mut proc_info = PROCESS_INFORMATION::default();
 
     unsafe {

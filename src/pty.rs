@@ -41,9 +41,15 @@ pub trait PtyWriter: AsyncWrite + Send + Sync + Unpin {
 
     /// Signal end-of-input to the process.
     ///
-    /// Best effort and platform dependent: on Windows it closes the ConPTY
-    /// input pipe (the child observes EOF on stdin); on Unix a tty master
-    /// cannot be half-closed, so this is currently a no-op there.
+    /// Best effort and platform dependent:
+    /// - **Windows**: closes the ConPTY *input pipe*. Empirically ConPTY
+    ///   treats a closed input stream as a console-close signal: attached
+    ///   clients are terminated (`STATUS_CONTROL_C_EXIT`), rather than
+    ///   merely observing stdin EOF. Prefer sending `0x1A` (`Ctrl+Z`) or
+    ///   `0x04` (msys tools) followed by a newline when the child should
+    ///   survive.
+    /// - **Unix**: a tty master cannot be half-closed, so this is a
+    ///   no-op — send `0x04` (canonical-mode EOT) instead.
     async fn eof(&self) -> Result<()>;
 }
 
@@ -178,17 +184,18 @@ impl Pty {
     pub async fn finish(self) -> Result<(Vec<u8>, i32)> {
         let (mut ctl, writer, mut reader) = self.split();
         // Reap the child concurrently; the drain below is the sequencing
-        // authority and also unblocks children stuck writing.
+        // authority and also unblocks children stuck writing. The writer
+        // is deliberately held until the end: on Windows closing the
+        // conin pipe is a console-close signal (clients die with
+        // STATUS_CONTROL_C_EXIT), and on Unix a tty master cannot be
+        // half-closed anyway — so both platforms keep input open here.
         let waiter = tokio::spawn(async move { ctl.wait().await });
-        // Done writing. On Windows this also EOFs the child's stdin (the
-        // writer thread drops the conin handle); on Unix a tty master
-        // cannot be half-closed, so it merely releases one master dup.
-        drop(writer);
         let mut out = Vec::new();
         reader.read_to_end(&mut out).await?;
         let code = waiter
             .await
             .map_err(|join| Error::IO(std::io::Error::other(join)))??;
+        drop(writer);
         Ok((out, code))
     }
 }

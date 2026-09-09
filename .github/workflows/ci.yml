@@ -34,7 +34,7 @@ jobs:
       # Serial + --nocapture: failures print inline at the exact test
       # instead of after the whole binary finishes (which never happens
       # when a test hangs).
-      - run: cargo test --all-targets -- --test-threads=1 --nocapture
+      - run: cargo test --all-targets --no-fail-fast -- --test-threads=1 --nocapture
 
   # Minimum Supported Rust Version (edition 2024 floor).
   msrv:

@@ -83,9 +83,15 @@ async fn no_output_loss_before_eof() {
         .expect("wait timed out")
         .expect("wait failed");
     assert_eq!(code, 0);
+    // ConPTY may hand us trailing empty lines alongside the payload.
     let text = String::from_utf8_lossy(&out);
-    assert_eq!(text.lines().count(), 50000, "lines lost");
-    assert_eq!(text.lines().last().unwrap().trim(), "50000", "tail lost");
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(lines.len(), 50000, "lines lost");
+    assert_eq!(lines.last().unwrap().trim(), "50000", "tail lost");
 }
 
 /// `wait` without draining deadlocks: a chatty child fills the tty output
@@ -251,7 +257,13 @@ async fn finish_drains_chatty_child() {
         .expect("finish timed out")
         .expect("finish failed");
     assert_eq!(code, 7);
+    // ConPTY may hand us trailing empty lines alongside the payload.
     let text = String::from_utf8_lossy(&out);
-    assert_eq!(text.lines().count(), 200000);
-    assert_eq!(text.lines().last().unwrap().trim(), "200000");
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(lines.len(), 200000);
+    assert_eq!(lines.last().unwrap().trim(), "200000");
 }

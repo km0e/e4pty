@@ -55,7 +55,7 @@
 //! | handle drop | Unix | Windows |
 //! |---|---|---|
 //! | `ctl` | no effect on the child (tokio reaps it; no zombie) | closes the ConPTY — attached clients are signalled and exit |
-//! | `reader` + `writer` | closes the master → `SIGHUP` to the foreground process group | writer drop delivers stdin EOF; the console session stays up until `ctl` drop |
+//! | `reader` + `writer` | closes the master → `SIGHUP` to the foreground process group | writer drop closes conin — ConPTY treats a closed input stream as a console-close signal (clients terminated) |
 //!
 //! To end a session explicitly, use [`PtyCtl::kill`] (`SIGKILL` /
 //! `TerminateProcess`) followed by `wait`. To end the *input* only, send
